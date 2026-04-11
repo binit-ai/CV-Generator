@@ -62,28 +62,74 @@ type TailoredCV = {
   }[];
 };
 
+/**
+ * Groq sometimes returns JSON wrapped in markdown fences or with leading prose.
+ * Try several extractions before giving up.
+ */
+function parseGroqJsonToTailoredCv(raw: string): TailoredCV {
+  const trimmed = raw.trim();
+  const candidates: string[] = [trimmed];
+
+  const fullFence = trimmed.match(/^```(?:json)?\s*\r?\n?([\s\S]*?)\r?\n?```\s*$/);
+  if (fullFence) {
+    candidates.push(fullFence[1].trim());
+  }
+
+  if (trimmed.startsWith("```")) {
+    let inner = trimmed.replace(/^```(?:json)?\s*\r?\n?/i, "");
+    inner = inner.replace(/\r?\n?```\s*$/i, "").trim();
+    if (inner) candidates.push(inner);
+  }
+
+  const firstBrace = trimmed.indexOf("{");
+  const lastBrace = trimmed.lastIndexOf("}");
+  if (firstBrace !== -1 && lastBrace > firstBrace) {
+    candidates.push(trimmed.slice(firstBrace, lastBrace + 1));
+  }
+
+  const seen = new Set<string>();
+  let lastError: unknown;
+  for (const c of candidates) {
+    if (!c || seen.has(c)) continue;
+    seen.add(c);
+    try {
+      return JSON.parse(c) as TailoredCV;
+    } catch (e) {
+      lastError = e;
+    }
+  }
+  throw lastError;
+}
+
 function buildSystemPrompt() {
   return `
-You are an expert CV writer and LaTeX CV formatter.
+You are an elite Executive Resume Writer and ATS (Applicant Tracking System) Optimization Specialist.
 
-Given a candidate's raw information and a target job description, you will:
-- Rewrite the CV content to be tailored for this specific role.
-- Emphasize the most relevant skills and experience.
-- Use concise, impact-focused bullet points with strong verbs and where possible, metrics.
-- Maintain a professional, neutral tone that would fit a senior software role CV.
+Given a candidate's raw information and a target job description, your objective is to completely optimize the CV content to achieve a maximum ATS match score while remaining compelling to human recruiters, without fabricating any information.
 
-Return ONLY a minified JSON object with the following shape (no markdown, no backticks, no explanation):
+Core Directives:
+1. Zero-Hallucination Rule: You are strictly forbidden from adding programming languages, frameworks, degrees, or job titles that the candidate did not explicitly provide. Do not hallucinate skills or experiences to match the Job Description (JD).
+2. Strategic Reframing: Pivot the candidate's existing experience to highlight valid overlaps with the JD. Reframe their true accomplishments to speak directly to the target role's requirements, but do not invent new responsibilities.
+3. ATS Keyword Mapping: Where the candidate's actual skills and experiences intersect with the JD's requirements, mirror the specific terminology mentioned in the JD. 
+4. High-Impact Bullet Points: Every bullet point must follow the XYZ format: "Accomplished [X] as measured by [Y], by doing [Z]".
+    * Start with a strong, high-signal action verb (e.g., Architected, Spearheaded, Optimized).
+    * Clearly state the technical or strategic action.
+    * Metric Integrity: Do not invent metrics, percentages, or scale. If the raw data lacks quantitative data, focus entirely on qualitative impact using strong, direct, and sensory language.
+5. Density and Signal: Maintain a direct and impactful writing style. Eliminate filler words, passive voice, and generic "responsible for" phrasing. Keep bullets concise and tightly packed with true technical keywords.
+6. Strict Formatting: Escape all LaTeX-sensitive characters by adding a backslash: %, $, &, #, _, {, }, ~, ^. (e.g., \\%).
+
+Return ONLY a minified JSON object matching the following schema. Do not include markdown code blocks, backticks, or any conversational text:
 {
   "full_name": string,
   "email": string,
   "phone": string,
   "linkedin": string,
   "location": string,
-  "summary": string,
+  "summary": "2-3 sentences max. Dense with true keywords, stating the candidate's core value proposition for this specific role in a highly direct tone.",
   "experience": [
     {
       "company": string,
-      "role": string,
+      "role": "Strict Title Preservation: You must use the exact job titles provided by the candidate.",
       "duration": string,
       "bullets": string[]
     }
@@ -111,10 +157,9 @@ Return ONLY a minified JSON object with the following shape (no markdown, no bac
   ]
 }
 
-Rules:
-- Escape any LaTeX-sensitive characters by adding a backslash: %, $, &, #, _, {, }, ~, ^.
-- Bullet points should be brief and high signal.
-- Tailor language to match key phrases and competencies in the job description.
+Schema notes (apply when generating JSON):
+- experience.bullets: 3-4 heavily optimized, direct bullets per role.
+- skills_sections.title: e.g. "Languages", "Frameworks", "Cloud & Tools"; organize the candidate's actual skills, front-loading the ones explicitly requested in the JD.
 `.trim();
 }
 
@@ -160,10 +205,9 @@ function buildLatex(cv: TailoredCV): string {
       const eduInstitution = escapeLatex(ed.institution);
       const eduYear = escapeLatex(ed.year);
       const eduDegree = escapeLatex(ed.degree);
-      const eduLocation = location;
       return `\\resumeSubheading
       {${eduInstitution}}{${eduYear}}
-      {${eduDegree}}{${eduLocation}}`;
+      {${eduDegree}}{}`;
     })
     .join("\n\n");
 
@@ -174,7 +218,7 @@ function buildLatex(cv: TailoredCV): string {
         .join("\n        ");
       return `\\resumeSubheading
       {${escapeLatex(exp.company)}}{${escapeLatex(exp.duration)}}
-      {${escapeLatex(exp.role)}}{${location}}
+      {${escapeLatex(exp.role)}}{}
       \\resumeItemListStart
         ${bullets}
       \\resumeItemListEnd`;
@@ -225,7 +269,7 @@ function buildLatex(cv: TailoredCV): string {
             const certIssuer = escapeLatex(c.issuer || "");
             return `\\resumeSubheading
       {${certName}}{${certYear}}
-      {${certIssuer}}{${location}}`;
+      {${certIssuer}}{}`;
           })
           .join("\n\n")
       : "";
@@ -381,7 +425,7 @@ function buildLatex(cv: TailoredCV): string {
     \\resumeSubHeadingListStart
       ${projectsBlocks}
     \\resumeSubHeadingListEnd
-\\vspace{-15pt}
+\\vspace{14pt}
 
 %-----------TECHNICAL SKILLS-----------
 \\section{Technical Skills}
@@ -441,23 +485,30 @@ export async function POST(req: NextRequest) {
   }
 
   try {
-    const userPayload = {
-      candidate_profile: {
-        full_name: body.fullName,
-        email: body.email,
-        phone: body.phone,
-        linkedin: body.linkedin,
-        location: body.location,
-        experiences: body.experiences,
-        education: body.education,
-        skills_raw: body.skills,
-        certifications: body.certifications,
-      },
-      job_description: body.jobDescription,
-    };
-
     const system = buildSystemPrompt();
-    const prompt = `Here is the candidate data and job description as JSON. Return only the JSON object described above.\n\n${JSON.stringify(userPayload)}`;
+    const prompt = `
+TARGET JOB DESCRIPTION:
+${body.jobDescription}
+
+CANDIDATE RAW DATA:
+${JSON.stringify({
+  full_name: body.fullName,
+  email: body.email,
+  phone: body.phone,
+  linkedin: body.linkedin,
+  location: body.location,
+  experiences: body.experiences,
+  education: body.education,
+  skills_raw: body.skills,
+  certifications: body.certifications,
+})}
+
+INSTRUCTIONS:
+1. Analyze the TARGET JOB DESCRIPTION to extract primary required skills, core competencies, and exact technical vocabulary.
+2. Rewrite the CANDIDATE RAW DATA to perfectly align with those extracted elements. 
+3. Elevate relevant experience to the top of bullet lists and rephrase previous duties to demonstrate proficiency in the target role's requirements.
+4. Output ONLY the raw, valid JSON object requested in the system prompt.
+`.trim();
 
     const completion = await groq.chat.completions.create({
       model: "llama-3.3-70b-versatile",
@@ -470,14 +521,29 @@ export async function POST(req: NextRequest) {
 
     const text = completion.choices?.[0]?.message?.content?.trim();
     if (!text) {
+      console.error("[Groq] Empty message content.", {
+        id: (completion as { id?: string }).id,
+        choices: completion.choices?.length,
+      });
       throw new Error("Unexpected response format from Groq.");
     }
 
     let cv: TailoredCV;
     try {
-      cv = JSON.parse(text) as TailoredCV;
-    } catch {
-      throw new Error("Failed to parse Groq response as JSON.");
+      cv = parseGroqJsonToTailoredCv(text);
+    } catch (parseErr) {
+      console.error("[Groq] JSON parse failed after extraction attempts.");
+      console.error("[Groq] Parse error:", parseErr);
+      console.error("[Groq] Raw response length:", text.length);
+      console.error("[Groq] Raw response (full):\n", text);
+      console.error("[Groq] Completion meta:", {
+        id: (completion as { id?: string }).id,
+        model: (completion as { model?: string }).model,
+        finish_reason: completion.choices?.[0]?.finish_reason,
+      });
+      throw new Error(
+        "Failed to parse Groq response as JSON. Check server logs for [Groq] lines.",
+      );
     }
 
     const latexSource = buildLatex(cv);
