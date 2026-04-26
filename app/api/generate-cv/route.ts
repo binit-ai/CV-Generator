@@ -3,7 +3,7 @@ import Groq from "groq-sdk";
 import { promises as fs } from "fs";
 import path from "path";
 import os from "os";
-import { execFile } from "child_process";
+import { exec } from "child_process";
 
 
 const groqApiKey = process.env.GROQ_API_KEY;
@@ -163,10 +163,86 @@ Schema notes (apply when generating JSON):
 `.trim();
 }
 
+function buildCopywriterSystemPrompt() {
+  return `
+You are an elite Executive Resume Writer.
+
+Given a candidate's raw information and a target job description, write a highly targeted, ATS-optimized resume in plain markdown.
+
+Core Directives:
+1. Zero-Hallucination Rule: You are strictly forbidden from adding programming languages, frameworks, degrees, certifications, employers, or job titles that the candidate did not explicitly provide. Do not invent skills, tools, or experiences to match the Job Description (JD).
+2. Strategic Reframing: Reframe ONLY the candidate's true experience to highlight valid overlaps with the JD. Do not invent new responsibilities.
+3. ATS Keyword Mapping: Where the candidate's actual skills and experiences intersect with the JD's requirements, mirror the JD terminology exactly.
+4. High-Impact Bullet Points: Every bullet must follow the XYZ format: "Accomplished [X] as measured by [Y], by doing [Z]".
+   - Start with a strong action verb (e.g., Architected, Spearheaded, Optimized).
+   - Metric Integrity: Do not invent metrics, percentages, scope, or scale. If metrics are missing, use qualitative impact only.
+5. Density and Signal: Avoid filler, passive voice, and "responsible for". Keep bullets concise and keyword-dense.
+
+Output Rules:
+- Output ONLY markdown resume content (no JSON, no code fences, no commentary).
+- Preserve the candidate's exact job titles as provided.
+- If a section is missing data, omit it rather than inventing content.
+`.trim();
+}
+
+function buildStrictJsonFormatterSystemPrompt() {
+  return `
+You are a Data Parser and Formatter.
+
+You will be given a resume in markdown text. Your task is to map that text into a minified JSON object that matches the required schema exactly.
+
+Hard Rules:
+1. Do NOT change wording from the provided markdown. Do not rewrite, paraphrase, or add content. Only package.
+2. Zero hallucination: If information is missing, use empty strings or empty arrays as appropriate; do not invent.
+3. Strict Title Preservation: For experience[].role, use the exact job titles present in the markdown.
+4. Strict Formatting: Escape all LaTeX-sensitive characters in ALL string fields by adding a backslash: %, $, &, #, _, {, }, ~, ^. Example: \\%.
+5. Output ONLY a minified JSON object (no markdown fences, no backticks, no extra text).
+
+Schema (must match):
+{
+  "full_name": string,
+  "email": string,
+  "phone": string,
+  "linkedin": string,
+  "location": string,
+  "summary": string,
+  "experience": [
+    { "company": string, "role": string, "duration": string, "bullets": string[] }
+  ],
+  "education": [
+    { "institution": string, "degree": string, "year": string, "details": string[] }
+  ],
+  "skills_sections": [
+    { "title": string, "items": string[] }
+  ],
+  "certifications": [
+    { "name": string, "issuer": string, "year": string }
+  ]
+}
+`.trim();
+}
+
 function escapeLatex(text: string | undefined | null): string {
   if (!text) return "";
   const sanitized = text.replace(/\r?\n/g, " ");
-  return sanitized
+  // Make escaping idempotent for inputs that already contain sequences like \%
+  // while still escaping any remaining LaTeX-sensitive characters.
+  const protectedSeq: Array<[RegExp, string]> = [
+    [/\\%/g, "__LATEX_ESC_PERCENT__"],
+    [/\\\$/g, "__LATEX_ESC_DOLLAR__"],
+    [/\\&/g, "__LATEX_ESC_AMP__"],
+    [/\\#/g, "__LATEX_ESC_HASH__"],
+    [/\\_/g, "__LATEX_ESC_UNDERSCORE__"],
+    [/\\\{/g, "__LATEX_ESC_LBRACE__"],
+    [/\\\}/g, "__LATEX_ESC_RBRACE__"],
+    [/\\~/g, "__LATEX_ESC_TILDE__"],
+    [/\\\^/g, "__LATEX_ESC_CARET__"],
+  ];
+
+  let out = sanitized;
+  for (const [re, token] of protectedSeq) out = out.replace(re, token);
+
+  out = out
     .replace(/\\/g, "\\textbackslash{}")
     .replace(/%/g, "\\%")
     .replace(/\$/g, "\\$")
@@ -177,6 +253,19 @@ function escapeLatex(text: string | undefined | null): string {
     .replace(/}/g, "\\}")
     .replace(/\^/g, "\\^{}")
     .replace(/~/g, "\\textasciitilde{}");
+
+  out = out
+    .replace(/__LATEX_ESC_PERCENT__/g, "\\%")
+    .replace(/__LATEX_ESC_DOLLAR__/g, "\\$")
+    .replace(/__LATEX_ESC_AMP__/g, "\\&")
+    .replace(/__LATEX_ESC_HASH__/g, "\\#")
+    .replace(/__LATEX_ESC_UNDERSCORE__/g, "\\_")
+    .replace(/__LATEX_ESC_LBRACE__/g, "\\{")
+    .replace(/__LATEX_ESC_RBRACE__/g, "\\}")
+    .replace(/__LATEX_ESC_TILDE__/g, "\\textasciitilde{}")
+    .replace(/__LATEX_ESC_CARET__/g, "\\^{}");
+
+  return out;
 }
 
 function buildLatex(cv: TailoredCV): string {
@@ -199,6 +288,18 @@ function buildLatex(cv: TailoredCV): string {
   const headerParts = [headerPhonePart, headerEmailPart, headerLinkedInPart]
     .filter(Boolean)
     .join(" ~ ");
+
+  const headerLines: string[] = [];
+  if (firstLast) {
+    headerLines.push(`{\\Huge \\scshape ${firstLast}} \\\\ \\vspace{1pt}`);
+  }
+  if (location) {
+    headerLines.push(`${location} \\\\ \\vspace{1pt}`);
+  }
+  if (headerParts) {
+    headerLines.push(`\\small ${headerParts} \\\\ \\vspace{-8pt}`);
+  }
+  const headerBlock = headerLines.length ? headerLines.join("\n    ") : `\\vspace{1pt}`;
 
   const educationBlocks = cv.education
     .map((ed) => {
@@ -392,9 +493,7 @@ function buildLatex(cv: TailoredCV): string {
 
 %----------HEADING----------
 \\begin{center}
-    {\\Huge \\scshape ${firstLast}} \\\\ \\vspace{1pt}
-    ${location} \\\\ \\vspace{1pt}
-    \\small ${headerParts} \\\\ \\vspace{-8pt}
+    ${headerBlock}
 \\end{center}
 
 %-----------EDUCATION-----------
@@ -485,61 +584,86 @@ export async function POST(req: NextRequest) {
   }
 
   try {
-    const system = buildSystemPrompt();
-    const prompt = `
+    const rawCandidateData = JSON.stringify({
+      full_name: body.fullName,
+      email: body.email,
+      phone: body.phone,
+      linkedin: body.linkedin,
+      location: body.location,
+      experiences: body.experiences,
+      education: body.education,
+      skills_raw: body.skills,
+      certifications: body.certifications,
+    });
+
+    // Agent 1: Expert Copywriter (markdown resume)
+    const writerSystem = buildCopywriterSystemPrompt();
+    const writerPrompt = `
 TARGET JOB DESCRIPTION:
 ${body.jobDescription}
 
 CANDIDATE RAW DATA:
-${JSON.stringify({
-  full_name: body.fullName,
-  email: body.email,
-  phone: body.phone,
-  linkedin: body.linkedin,
-  location: body.location,
-  experiences: body.experiences,
-  education: body.education,
-  skills_raw: body.skills,
-  certifications: body.certifications,
-})}
+${rawCandidateData}
 
-INSTRUCTIONS:
-1. Analyze the TARGET JOB DESCRIPTION to extract primary required skills, core competencies, and exact technical vocabulary.
-2. Rewrite the CANDIDATE RAW DATA to perfectly align with those extracted elements. 
-3. Elevate relevant experience to the top of bullet lists and rephrase previous duties to demonstrate proficiency in the target role's requirements.
-4. Output ONLY the raw, valid JSON object requested in the system prompt.
+Write the best possible targeted resume in markdown. Use strong section headings (e.g., Summary, Experience, Education, Skills, Certifications) and 3-4 bullets per role in XYZ format when possible.
 `.trim();
 
-    const completion = await groq.chat.completions.create({
+    const writerCompletion = await groq.chat.completions.create({
       model: "llama-3.3-70b-versatile",
-      temperature: 0.4,
+      temperature: 0.6,
       messages: [
-        { role: "system", content: system },
-        { role: "user", content: prompt },
+        { role: "system", content: writerSystem },
+        { role: "user", content: writerPrompt },
       ],
     });
 
-    const text = completion.choices?.[0]?.message?.content?.trim();
-    if (!text) {
-      console.error("[Groq] Empty message content.", {
-        id: (completion as { id?: string }).id,
-        choices: completion.choices?.length,
+    const writerText = writerCompletion.choices?.[0]?.message?.content?.trim();
+    if (!writerText) {
+      console.error("[Groq][Agent1] Empty message content.", {
+        id: (writerCompletion as { id?: string }).id,
+        choices: writerCompletion.choices?.length,
       });
-      throw new Error("Unexpected response format from Groq.");
+      throw new Error("Unexpected response format from Groq (Agent 1).");
+    }
+
+    // Agent 2: Strict JSON Formatter (minified JSON only)
+    const formatterSystem = buildStrictJsonFormatterSystemPrompt();
+    const formatterPrompt = `
+RESUME MARKDOWN (do not rewrite any wording; only package into JSON):
+${writerText}
+`.trim();
+
+    const formatterCompletion = await groq.chat.completions.create({
+      model: "llama-3.3-70b-versatile",
+      temperature: 0.1,
+      messages: [
+        { role: "system", content: formatterSystem },
+        { role: "user", content: formatterPrompt },
+      ],
+    });
+
+    const formatterText =
+      formatterCompletion.choices?.[0]?.message?.content?.trim();
+    if (!formatterText) {
+      console.error("[Groq][Agent2] Empty message content.", {
+        id: (formatterCompletion as { id?: string }).id,
+        choices: formatterCompletion.choices?.length,
+      });
+      throw new Error("Unexpected response format from Groq (Agent 2).");
     }
 
     let cv: TailoredCV;
     try {
-      cv = parseGroqJsonToTailoredCv(text);
+      cv = parseGroqJsonToTailoredCv(formatterText);
     } catch (parseErr) {
-      console.error("[Groq] JSON parse failed after extraction attempts.");
+      console.error("[Groq][Agent2] JSON parse failed after extraction attempts.");
       console.error("[Groq] Parse error:", parseErr);
-      console.error("[Groq] Raw response length:", text.length);
-      console.error("[Groq] Raw response (full):\n", text);
-      console.error("[Groq] Completion meta:", {
-        id: (completion as { id?: string }).id,
-        model: (completion as { model?: string }).model,
-        finish_reason: completion.choices?.[0]?.finish_reason,
+      console.error("[Groq][Agent2] Raw response length:", formatterText.length);
+      console.error("[Groq][Agent2] Raw response (full):\n", formatterText);
+      console.error("[Groq][Agent2] Completion meta:", {
+        id: (formatterCompletion as { id?: string }).id,
+        model: (formatterCompletion as { model?: string }).model,
+        finish_reason: formatterCompletion.choices?.[0]?.finish_reason,
       });
       throw new Error(
         "Failed to parse Groq response as JSON. Check server logs for [Groq] lines.",
@@ -580,35 +704,20 @@ INSTRUCTIONS:
       await fs.access(texPath);
       console.error(".tex file access check: OK");
 
-      const texbin = "/Library/TeX/texbin";
-      const pdflatexPath = `${texbin}/pdflatex`;
-      const childEnvPath =
-        "/Library/TeX/texbin:/usr/local/bin:/usr/bin:/bin";
-
       console.error("Running pdflatex:");
-      console.error("  executable:", pdflatexPath);
       console.error("  cwd:", tmpDir);
-      console.error("  args:", [
-        "-interaction=nonstopmode",
-        "-halt-on-error",
-        "cv.tex",
-      ]);
-      console.error("  child PATH:", childEnvPath);
+      console.error(
+        "  cmd:",
+        "pdflatex -interaction=nonstopmode -halt-on-error cv.tex",
+      );
 
       const compileResult = await new Promise<{
         stdout: string;
         stderr: string;
       }>((resolve, reject) => {
-        execFile(
-          pdflatexPath,
-          ["-interaction=nonstopmode", "-halt-on-error", "cv.tex"],
-          {
-            cwd: tmpDir,
-            env: {
-              ...process.env,
-              PATH: childEnvPath,
-            },
-          },
+        exec(
+          "pdflatex -interaction=nonstopmode -halt-on-error cv.tex",
+          { cwd: tmpDir },
           (error, stdout, stderr) => {
             if (error) {
               const e: any = error;
